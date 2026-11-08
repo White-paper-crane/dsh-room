@@ -2,7 +2,8 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { CLOSED as CLOSED_LEDGER_STATES, SUBSTANTIVE_KINDS } from "../protocol.mjs";
+import { CAP, CLOSED as CLOSED_LEDGER_STATES, SUBSTANTIVE_KINDS } from "../protocol.mjs";
+import { tally } from "../capacity-lib.mjs";
 
 // 归档会话来源：默认 ~/.dsh/storages/workspace.json，可用环境变量覆盖（测试/换机时用）
 export const DEFAULT_WORKSPACE_FILE = process.env.DS_TEAMS_WORKSPACE_FILE
@@ -99,6 +100,8 @@ export function buildHealth({
     at: new Date(now).toISOString(),
     rooms: (db.rooms || []).map((r) => roomHealth(r, byRoom.get(r.id) || [], { ledger, closedStates, now })),
     bridges: bridgeHealth(db.seq, dataDir),
+    // 并发名额：cap 是上限（DS_TEAMS_CAP_* 可覆盖），used 是当前占用，房间/项目分桶。
+    capacity: { cap: CAP, used: tally(ledger) },
     archived: { sessions: readArchivedSessions(workspaceFile) },
   };
 }

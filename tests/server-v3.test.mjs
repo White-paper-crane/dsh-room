@@ -324,10 +324,12 @@ test("隔离实例：掉线接管（临时台账 + 测试房，15 分钟条件�
     const room = await eapi("POST", "/api/rooms", { who: "me", title: "v3服务端-takeover隔离", declaredBy: "me" });
     assert.equal(room.status, 200);
     const rid = room.data.room.id;
+    // A12（2026-11-08）：接管的三个条件——失联、认领满 15 分钟、且至少 5 分钟没有任何动静。
+    // 这里的 updatedAt 跟着 claimedAt 走：真掉线的那端写不了账，卡自然不会显新。
     const mk = (taskId, title, claimedAgoMin) => ({
       roomId: rid, taskId, title, assignee: "me", state: "claimed", attempts: 1,
       claimedAt: new Date(Date.now() - claimedAgoMin * 60 * 1000).toISOString(),
-      updatedAt: new Date().toISOString(), events: [],
+      updatedAt: new Date(Date.now() - claimedAgoMin * 60 * 1000).toISOString(), events: [],
     });
     const tasks = { [`${rid}::t1`]: mk("t1", "掉线交接任务一", 20), [`${rid}::t2`]: mk("t2", "刚接的任务二", 1) };
     fs.writeFileSync(inst.ledger, JSON.stringify({ version: 1, tasks }, null, 2));

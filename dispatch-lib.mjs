@@ -6,7 +6,9 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { ACTIVE, TERMINAL, CAP, LIMITS } from "./protocol.mjs";
+import { ACTIVE, TERMINAL, CAP, LIMITS, TASK_STATES } from "./protocol.mjs";
+// T6（2026-11-07）：名额计算改成纯函数，房间任务与项目任务分桶；见 capacity-lib.mjs。
+import { tally, admit } from "./capacity-lib.mjs";
 
 export { CAP };
 
@@ -57,47 +59,93 @@ export function writeLedger(db) {
 }
 
 // 跨进程互斥：桌面端桥接与 QQ 端会话都会写台账，读-改-写必须串行。
-// 锁文件 + 重试；持锁超过 10 秒视为死锁残留，直接破掉（宁可丢一次写，不卡死）。
+// A3（2026-11-08）修的是两件事：
+//   ① 以前拿到锁后收尾无条件删锁文件。锁一旦被别人破掉并重建，这一删就删掉了别人的锁，
+//      互斥当场失效。现在锁里写 {pid, token}，释放前核对 token，不是自己的锁不删。
+//   ② 以前 mtime 超 10 秒就破锁，两个进程可能同时动手。现在先看持有者 pid 是否还活着，
+//      死了立即破；活着只认超时（默认 10 秒），并用原子 rename 抢走再删——同时破只有一个能赢。
+// 等不到锁时抛 code=LEDGER_BUSY（不再是一句笼统的 timeout），调用方按 tick 重试即可。
 const LOCK = LEDGER + ".lock";
-function withLedgerLock(fn, { timeoutMs = 3000, staleMs = 10000 } = {}) {
+const LOCK_TIMEOUT_MS = Number(process.env.DS_TEAMS_LOCK_TIMEOUT_MS) || 5000;
+const LOCK_STALE_MS = Number(process.env.DS_TEAMS_LOCK_STALE_MS) || 10000;
+
+function pidAlive(pid) {
+  try { process.kill(pid, 0); return true; } catch (e) { return Boolean(e && e.code === "EPERM"); }
+}
+
+function readLockRecord() {
+  try { return JSON.parse(fs.readFileSync(LOCK, "utf8")); } catch { return null; }
+}
+
+function ledgerBusy(msg) {
+  const e = new Error(msg);
+  e.code = "LEDGER_BUSY";
+  return e;
+}
+
+// 抢锁：wx 原子创建；抢到就把身份写进去，写失败不影响持锁（还有 pid 兜底）。
+function tryLock(token) {
+  let fd;
+  try {
+    fd = fs.openSync(LOCK, "wx");
+  } catch (e) {
+    if (e && e.code === "EEXIST") return null;
+    throw e;
+  }
+  try { fs.writeSync(fd, JSON.stringify({ pid: process.pid, token, at: Date.now() })); } catch {}
+  return fd;
+}
+
+// 破锁：只在「确实死了」时动手；rename 抢走是原子的，两个进程同时破只有一个成功。
+// 有 pid 就只认活性——活着的一律不抢，哪怕它握了很久（卡住的进程由调用方超时报错重试，
+// 抢活锁才是真的会把两个人的读改写搅在一起，那是 A3 的老毛病）。没有身份信息的老锁才按时间兜底。
+function breakStaleLock(token, staleMs) {
+  let st;
+  try { st = fs.statSync(LOCK); } catch { return true; }   // 已经没了：当作已破
+  const rec = readLockRecord();
+  if (rec && Number(rec.pid)) {
+    if (pidAlive(Number(rec.pid))) return false;
+  } else if (Date.now() - st.mtimeMs <= staleMs) {
+    return false;
+  }
+  const grave = LOCK + ".stale-" + token;
+  try { fs.renameSync(LOCK, grave); } catch { return false; }   // 别人先破了，或文件还被持锁进程占着
+  try { fs.rmSync(grave, { force: true }); } catch {}
+  return true;
+}
+
+function withLedgerLock(fn, { timeoutMs = LOCK_TIMEOUT_MS, staleMs = LOCK_STALE_MS } = {}) {
   fs.mkdirSync(path.dirname(LEDGER), { recursive: true });
+  const token = `${process.pid}-${crypto.randomBytes(6).toString("hex")}`;
   const start = Date.now();
   let fd = null;
   while (fd === null) {
-    try {
-      fd = fs.openSync(LOCK, "wx");
-    } catch (e) {
-      if (e && e.code !== "EEXIST") throw e;
-      try {
-        if (Date.now() - fs.statSync(LOCK).mtimeMs > staleMs) fs.rmSync(LOCK, { force: true });
-      } catch {}
-      if (Date.now() - start > timeoutMs) throw new Error("ledger lock timeout: " + LOCK);
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+    fd = tryLock(token);
+    if (fd !== null) break;
+    if (breakStaleLock(token, staleMs)) continue;
+    if (Date.now() - start > timeoutMs) {
+      const rec = readLockRecord();
+      throw ledgerBusy(`ledger busy: waited ${timeoutMs}ms, holder ${rec && rec.pid ? "pid " + rec.pid : "unknown"}`);
     }
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
   }
   try {
     return fn();
   } finally {
     try { fs.closeSync(fd); } catch {}
-    try { fs.rmSync(LOCK, { force: true }); } catch {}
+    try {
+      const rec = readLockRecord();
+      if (rec && rec.token === token) fs.rmSync(LOCK, { force: true });
+    } catch {}
   }
 }
 
 export function counts(db = readLedger()) {
-  let g = 0;
-  const rooms = {};
-  for (const e of Object.values(db.tasks)) {
-    if (!ACTIVE.has(e.state)) continue;
-    g++;
-    rooms[e.roomId] = (rooms[e.roomId] ?? 0) + 1;
-  }
-  return { global: g, rooms };
+  return tally(db);
 }
 
-const canClaim = (roomId, db = readLedger()) => {
-  const c = counts(db);
-  return c.global < CAP.global && (c.rooms[roomId] ?? 0) < CAP.room;
-};
+// 这个任务现在能不能占名额：全局 + 自己那个桶（房间 / 项目各算各的）。
+const fits = (entry, db = readLedger()) => admit(entry, db, CAP);
 
 // 原子 claim：同 (roomId, taskId) 只成功一次。
 // 名额满时落 queued（不 spawn），返回 queued:true + 排队位置；有位置才 claimed。
@@ -121,7 +169,7 @@ function claimLocked(roomId, taskId, seq, extra = {}) {
   };
   if (extra.deadlineAt) entry.deadlineAt = extra.deadlineAt;
   let queued = false;
-  if (!canClaim(entry.roomId, db)) {
+  if (!fits(entry, db).ok) {
     entry.state = "queued";
     entry.queuedAt = now;
     entry.queuePos = Object.values(db.tasks).filter((e) => e.state === "queued").length + 1;
@@ -132,10 +180,48 @@ function claimLocked(roomId, taskId, seq, extra = {}) {
   return { ok: true, duplicate: false, queued, key: k, entry };
 }
 
+// A10（2026-11-08）：`dispatch set` 以前什么都能写，也不看名额——
+// 一句 `set <key> running` 就能把 3 个名额撑到 4 个，或者把 done 戳回 claimed。
+// 现在按表校验：非法迁移直接拒（中文提示允许哪些），从空闲进活跃状态要先过名额检查。
+const TRANSITIONS = Object.freeze({
+  queued: ["claimed", "spawned", "running", "blocked", "aborted", "timeout", "failed"],
+  claimed: ["spawned", "running", "reported", "queued", "blocked", "aborted", "timeout", "interrupted", "failed", "done"],
+  spawned: ["claimed", "running", "reported", "queued", "blocked", "aborted", "timeout", "interrupted", "failed", "done"],
+  running: ["spawned", "reported", "blocked", "aborted", "timeout", "interrupted", "failed", "done"],
+  reported: ["running", "done", "blocked", "aborted", "timeout", "interrupted"],
+  blocked: ["queued", "claimed", "running", "aborted", "done", "timeout"],
+  timeout: ["queued", "claimed", "running", "aborted", "done"],
+  interrupted: ["queued", "claimed", "running", "aborted", "done"],
+  done: ["aborted", "reported"],
+  failed: ["queued", "aborted", "done"],
+  aborted: ["queued"],
+  reviewed: ["done", "aborted"],
+});
+
 function setStateLocked(key, state, patch = {}) {
   const db = readLedger();
   const e = db.tasks[key];
   if (!e) return { ok: false, error: "unknown key " + key };
+  if (!TASK_STATES.includes(state)) {
+    return { ok: false, error: `unknown state ${state}（合法状态：${TASK_STATES.join("|")}）` };
+  }
+  if (state !== e.state) {
+    const allowed = TRANSITIONS[e.state] || [];
+    if (!allowed.includes(state)) {
+      return { ok: false, error: `illegal transition ${e.state} -> ${state}（允许：${allowed.join("|") || "无"}）` };
+    }
+    // 空转 → 活跃：得有名额，否则 set 就成了绕过并发上限的后门。
+    if (ACTIVE.has(state) && !ACTIVE.has(e.state)) {
+      const a = fits(e, db);
+      if (!a.ok) {
+        return {
+          ok: false,
+          error: `cap full: ${a.bucket} ${a.used}/${a.cap}, global ${a.global}/${a.globalCap}`,
+          cap: { bucket: a.bucket, key: a.key, used: a.used, cap: a.cap, global: a.global, globalCap: a.globalCap },
+        };
+      }
+    }
+  }
   const { by = "", ...rest } = patch;
   const from = e.state;
   e.state = state;
@@ -156,7 +242,7 @@ function promoteLocked() {
     .sort((a, b) => (a[1].sourceSeq ?? 0) - (b[1].sourceSeq ?? 0));
   const out = [];
   for (const [k, e] of q) {
-    if (!canClaim(e.roomId, db)) continue;
+    if (!fits(e, db).ok) continue;
     e.state = "claimed";
     e.updatedAt = new Date().toISOString();
     delete e.queuePos;
@@ -179,11 +265,16 @@ function failLocked(key, reason = "") {
   e.state = retry ? "queued" : "failed";
   if (retry) e.queuedAt = e.updatedAt;
   writeLedger(db);
-  return { ok: true, retry, attempts: e.attempts, state: e.state };
+  // T2（2026-11-07）：这次没回到队列（真失败）→ 名额空出，就地提升。
+  return { ok: true, retry, attempts: e.attempts, state: e.state, promoted: retry ? [] : promoteLocked() };
 }
 
-// 超时看门狗：deadlineAt 过期、或 claimed/queued 卡太久 → timeout。
-// 返回被改动的 [{ key, from, reason }]。
+// 超时看门狗：deadlineAt 过期，或 claimed/running 长时间没有进度信号 → timeout。
+// A5（2026-11-08）：以前只认 updatedAt，而 updatedAt 是「台账写入时间」——
+//   ① 长任务只要不碰台账，claimed 15 分钟/ running 45 分钟就被当成卡死杀掉；
+//   ② 反过来任何无关字段的写入又会把计时归零。
+// 现在优先用 e.heartbeatAt（touch() 写的进度心跳），没有心跳才退回 updatedAt/claimedAt；
+// 任务可以用 e.stallMs 自报时限（例如预计 3 小时的活），deadlineAt 仍然最硬。
 function watchdogLocked(opts = {}) {
   const claimedMs = opts.claimedMs ?? DEFAULTS.claimedMs;
   const runMs = opts.runMs ?? DEFAULTS.runMs;
@@ -193,9 +284,11 @@ function watchdogLocked(opts = {}) {
   const out = [];
   for (const [k, e] of Object.entries(db.tasks)) {
     if (TERMINAL.has(e.state)) continue;
-    const ts = Date.parse(e.updatedAt || e.claimedAt || "") || now;
+    const ts = Date.parse(e.heartbeatAt || "") || Date.parse(e.updatedAt || e.claimedAt || "") || now;
+    const stall = Number(e.stallMs) > 0 ? Number(e.stallMs) : 0;
     let reason = "";
     if (e.deadlineAt && Date.parse(e.deadlineAt) < now) reason = "deadline passed";
+    else if (stall && now - ts > stall) reason = `${e.state} 无进度 ${Math.round(stall / 60000)} 分钟（自报时限）`;
     else if (e.state === "queued" && now - ts > queuedMs) reason = "queued too long";
     else if (e.state === "claimed" && now - ts > claimedMs) reason = "claimed but never spawned";
     else if (e.state === "spawned" && now - ts > claimedMs) reason = "spawned but never running";
@@ -205,9 +298,29 @@ function watchdogLocked(opts = {}) {
     e.state = "timeout";
     e.timeoutReason = reason;
     e.updatedAt = new Date().toISOString();
+    pushEvent(e, "timeout", "watchdog", reason);
   }
   if (out.length) writeLedger(db);
   return out;
+}
+
+// 进度心跳：长任务每隔一阵子调一次，watchdog 就以它为计时起点；不动状态。
+// 终态任务不接心跳（否则错账，看起来像还活着）。
+function touchLocked(key, input = {}) {
+  const db = readLedger();
+  const e = db.tasks[key];
+  if (!e) return { ok: false, error: "unknown key " + key };
+  if (TERMINAL.has(e.state)) return { ok: false, error: "terminal task: " + e.state };
+  const at = nowIso();
+  e.heartbeatAt = at;
+  e.updatedAt = at;
+  const note = String(input.note || "").slice(0, 200);
+  if (note) pushEvent(e, "touch", input.by || "", note);
+  // 长任务可以顺手自报「多久没动静算卡死」；看门狗用 e.stallMs 覆盖默认阈值。
+  const stallMs = Number(input.stallMs);
+  if (Number.isFinite(stallMs) && stallMs > 0) e.stallMs = stallMs;
+  writeLedger(db);
+  return { ok: true, key, entry: e };
 }
 
 const REVIEW_VERDICTS = new Set(["pass", "fail"]);
@@ -337,7 +450,7 @@ function startTaskLocked(key, input = {}) {
   const now = nowIso();
   const owner = String(input.owner || e.owner || "lead").trim();
   const assignee = String(input.assignee || e.assignee || owner).trim();
-  if (!canClaim(e.roomId, db)) {
+  if (!fits(e, db).ok) {
     e.state = "queued";
     e.owner = owner;
     e.assignee = assignee;
@@ -365,7 +478,11 @@ function reportTaskLocked(key, input = {}) {
   const db = readLedger();
   const e = db.tasks[key];
   if (!e) return { ok: false, error: "unknown key " + key };
-  if (!["claimed", "running", "reported"].includes(e.state)) {
+  // A5（2026-11-08）：被 watchdog 判成 timeout/interrupted 的卡，活可能其实已经干完——
+  // 以前这种迟到报告直接拒收。
+  const canReport = ["claimed", "running", "reported"].includes(e.state);
+  const late = ["timeout", "interrupted"].includes(e.state);
+  if (!canReport && !late) {
     return { ok: false, error: "cannot report from state " + e.state };
   }
   const list = Array.isArray(input.artifacts) ? input.artifacts : [];
@@ -388,6 +505,17 @@ function reportTaskLocked(key, input = {}) {
   e.artifacts = Array.isArray(e.artifacts) ? e.artifacts : [];
   for (const a of out) {
     if (!e.artifacts.some((x) => x.path === a.path && x.sha256 === a.sha256)) e.artifacts.push(a);
+  }
+  // A5（2026-11-08）：被 watchdog 判了 timeout/interrupted 的卡，活可能其实已经干完。
+  // 以前这种报告一律被拒，成果只能散在聊天里。现在允许迟到报告：只落 artifacts/summary 留痕，
+  // 状态保持在终态（名额不会因此被二次占用），也不重开任务。
+  if (!canReport) {
+    e.lateReportAt = nowIso();
+    e.lateSummary = String(input.summary || "").slice(0, 1000);
+    e.updatedAt = e.lateReportAt;
+    pushEvent(e, "late-report", input.by || e.owner, e.lateSummary || `${out.length} artifact(s)`);
+    writeLedger(db);
+    return { ok: true, key, late: true, state: e.state, entry: e, added: out.length };
   }
   e.state = "reported";
   e.reportedAt = nowIso();
@@ -445,7 +573,8 @@ function acceptTaskLocked(key, input = {}) {
   e.updatedAt = at;
   pushEvent(e, "accepted", e.acceptedBy, force ? "forced: " + note : note);
   writeLedger(db);
-  return { ok: true, key, entry: e };
+  // T2（2026-11-07）：名额刚空出来，立刻把排队的提上来，不等下一次 15 秒维护窗口。
+  return { ok: true, key, entry: e, promoted: promoteLocked() };
 }
 
 function rejectTaskLocked(key, input = {}) {
@@ -463,7 +592,42 @@ function rejectTaskLocked(key, input = {}) {
   e.updatedAt = at;
   pushEvent(e, "rejected", input.by || "you", note);
   writeLedger(db);
-  return { ok: true, key, entry: e };
+  // T2（2026-11-07）：blocked 不占名额，同样就地提升。
+  return { ok: true, key, entry: e, promoted: promoteLocked() };
+}
+
+// T2 配套（2026-11-07）：已 claimed 但还没人去 spawn 的任务，交给桥去叫醒 agent。
+// 提醒后打 nudgedAt，5 分钟内不重复（15 秒 tick 反复注入会烧预算）。
+// A2（2026-11-08）：提醒没送出去（agent 正忙，桥 return false）时用 clearNudge 立刻还账；
+// 否则要干等 5 分钟 TTL，claimed 卡到 15 分钟看门狗上就变 timeout 死单。
+// A12（2026-11-08）：接管过的卡只归接手那一端（handoff.to）；传 assignee 时不提醒别人。
+const NUDGE_TTL_MS = 300_000;
+
+function claimedAwaitingSpawnLocked(now = Date.now(), { assignee = "" } = {}) {
+  const db = readLedger();
+  const out = [];
+  for (const [k, e] of Object.entries(db.tasks)) {
+    if (e.state !== "claimed") continue;
+    if (Array.isArray(e.subtasks) && e.subtasks.length) continue;
+    if (assignee && e.handoff && e.handoff.to && e.handoff.to !== assignee) continue;
+    const last = Date.parse(e.nudgedAt || "") || 0;
+    if (last && now - last < NUDGE_TTL_MS) continue;
+    out.push(k);
+  }
+  out.sort();
+  for (const k of out) db.tasks[k].nudgedAt = new Date(now).toISOString();
+  if (out.length) writeLedger(db);
+  return out;
+}
+
+// 撤掉一次没送到的提醒；不动 updatedAt（看门狗计时不受影响）。
+function clearNudgeLocked(key) {
+  const db = readLedger();
+  const e = db.tasks[key];
+  if (!e || !e.nudgedAt) return { ok: false };
+  delete e.nudgedAt;
+  writeLedger(db);
+  return { ok: true, key };
 }
 
 export function listTasks({ projectId = "", all = true } = {}) {
@@ -493,6 +657,12 @@ export function controlCounts(db = readLedger()) {
 export function claim(roomId, taskId, seq, extra = {}) { return withLedgerLock(() => claimLocked(roomId, taskId, seq, extra)); }
 export function setState(key, state, patch = {}) { return withLedgerLock(() => setStateLocked(key, state, patch)); }
 export function promote() { return withLedgerLock(() => promoteLocked()); }
+export function claimedAwaitingSpawn(opts = {}) {
+  const o = typeof opts === "string" ? { assignee: opts } : opts || {};
+  return withLedgerLock(() => claimedAwaitingSpawnLocked(Date.now(), o));
+}
+export function clearNudge(key) { return withLedgerLock(() => clearNudgeLocked(key)); }
+export function touch(key, input = {}) { return withLedgerLock(() => touchLocked(key, input)); }
 export function fail(key, reason = '') { return withLedgerLock(() => failLocked(key, reason)); }
 export function watchdog(opts = {}) { return withLedgerLock(() => watchdogLocked(opts)); }
 export function addReview(key, opts = {}) { return withLedgerLock(() => addReviewLocked(key, opts)); }

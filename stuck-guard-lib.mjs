@@ -39,7 +39,11 @@ export function noteHold(book, sessionId, seq, kind, now = Date.now()) {
   if (!sessionId) return null;
   const e = book.get(sessionId) || { firstBusyAt: 0, lastSeq: null, holds: 0, lastHoldAt: 0 };
   if (!e.firstBusyAt) e.firstBusyAt = now;
-  e.lastHoldAt = now;
+  // 2026-11-07：lastHoldAt 记的是「当前这条消息第一次被 hold 的时刻」，不是每次重试。
+  // 以前每 2 秒重试都刷新它，decideStuck 的 jobAt 就永远被顶到 now，判据恒为「还在动」，
+  // 自愈成了死代码（两端日志 stuck-reset 一直是 0）。只有换了新消息才重新计时。
+  const s = Number(seq);
+  if (!e.lastHoldAt || (Number.isFinite(s) && e.lastSeq !== s)) e.lastHoldAt = now;
   if (Number.isFinite(seq)) e.lastSeq = Number(seq);
   if (isBusyKind(kind)) e.holds += 1;
   book.set(sessionId, e);
@@ -106,13 +110,16 @@ export function decideStuck({ now = Date.now(), holds, activity = [], lastRoomAt
   for (const a of activity) {
     if (!a || !a.id) continue;
     if (!isBusyKind(a.kind)) continue;
-    const since = Number(a.sinceMs) || 0;
-    if (!since || now - since < STUCK_MS) continue;
     const book = holds?.get?.(a.id) || null;
+    // 计时窗口起点 = 这一轮 busy 的开始，或「当前这条消息第一次被 hold」的时刻，取晚者。
+    // 有新消息进来就重新计时（那是新活）；同一条消息的重试不重置（重试不是进展）。
+    const since = Math.max(Number(a.sinceMs) || 0, Number(book?.lastHoldAt) || 0);
+    if (!since || now - since < STUCK_MS) continue;
     const holdsTotal = (Number(a.holds) || 0) + (Number(book?.holds) || 0);
     if (holdsTotal < STUCK_HOLDS) continue;   // 没人给它递过东西 → 可能在干别的活，不碰
-    const jobAt = Math.max(Number(a.lastSeqAt) || 0, Number(book?.lastHoldAt) || 0);
-    if (jobAt > since) continue;               // ① 有进展 → 还在动，清零重算
+    // ① 只认真进展：桥事件日志里又出现了带 seq 的新行。hold 重试、注入尝试都不算。
+    const jobAt = Number(a.lastSeqAt) || 0;
+    if (jobAt > since) continue;               // 有进展 → 还在动，清零重算
     const rid = roomOf(a.id);
     const roomAt = rid ? Number(lastRoomAt(rid)) || 0 : 0;
     if (roomAt > since) continue;              // ③ 房内刚有人说话、本端正在往回写 → 不杀

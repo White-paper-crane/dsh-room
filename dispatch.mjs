@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // ds-teams · dispatch 台账 CLI（大满、小满的回合里都可用）
 //   node dispatch.mjs claim <roomId> <taskId> [--seq N] [--assignee daman]
-//   node dispatch.mjs set   <roomId> <taskId> <state> [--sub s1,s2] [--mate m1,m2]
+//   node dispatch.mjs set   <roomId> <taskId> <state> [--sub s1,s2] [--mate m1,m2] [--stall-min N]
+//   node dispatch.mjs touch <roomId> <taskId> [--stall-min N] [--note "..."]
 //   node dispatch.mjs get   <roomId> <taskId>
 //   node dispatch.mjs list  [--all]
 //   node dispatch.mjs resume            （进程启动/插件重载后：非终态 -> interrupted）
@@ -12,7 +13,7 @@
 //   node dispatch.mjs room-status <roomId>
 //   node dispatch.mjs counts
 // 退出码：0 成功；2 用法错；3 重复 claim（已存在，调用方应无视）。
-import { claim, readLedger, setState, markInterrupted, taskKey, promote, watchdog, fail, counts, addReview, roomStatus } from "./dispatch-lib.mjs";
+import { claim, readLedger, setState, touch, markInterrupted, taskKey, promote, watchdog, fail, counts, addReview, roomStatus } from "./dispatch-lib.mjs";
 import { CAP, TERMINAL } from "./protocol.mjs";
 
 const argv = process.argv.slice(2);
@@ -37,8 +38,23 @@ if (cmd === "claim") {
   const patch = {};
   if (flag("sub")) patch.subtasks = flag("sub").split(",").map((s) => s.trim()).filter(Boolean);
   if (flag("mate")) patch.teammates = flag("mate").split(",").map((s) => s.trim()).filter(Boolean);
+  if (flag("stall-min")) patch.stallMs = Number(flag("stall-min")) * 60e3;
   const r = setState(taskKey(roomId, taskId), state, patch);
   console.log(JSON.stringify(r));
+  // A10：状态非法/超额时把原因打到 stderr——以前只给退出码 2，调用方看不出为什么。
+  if (!r.ok) console.error(String(r.error || "set failed"));
+  process.exit(r.ok ? 0 : 2);
+} else if (cmd === "touch") {
+  const [roomId, taskId] = pos;
+  if (!roomId || !taskId) die("usage: touch <roomId> <taskId> [--stall-min N] [--note \"...\"]");
+  const stall = flag("stall-min");
+  const r = touch(taskKey(roomId, taskId), {
+    by: flag("by", "daman"),
+    note: flag("note"),
+    stallMs: stall === "" ? undefined : Number(stall) * 60e3,
+  });
+  console.log(JSON.stringify(r));
+  if (!r.ok) console.error(String(r.error || "touch failed"));
   process.exit(r.ok ? 0 : 2);
 } else if (cmd === "get") {
   const [roomId, taskId] = pos;
@@ -79,5 +95,5 @@ if (cmd === "claim") {
 } else if (cmd === "counts") {
   console.log(JSON.stringify({ ok: true, cap: CAP, ...counts() }));
 } else {
-  die("usage: claim|set|get|list|resume|promote|watchdog|fail|review|room-status|counts");
+  die("usage: claim|set|touch|get|list|resume|promote|watchdog|fail|review|room-status|counts");
 }

@@ -105,6 +105,24 @@
   .count[data-count="review"] .count-value { color: var(--amber); }
   .count[data-count="blocked"] .count-value { color: var(--amber); }
   .count[data-count="done"] .count-value { color: var(--green); }
+  .count[data-count="capacity"] .count-value { color: var(--muted); font-size: 15px; }
+
+  /* T6：并发名额分桶——房间任务与项目任务各占各的额度，全局额度管两者之和。 */
+  .capacity {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px 16px;
+    padding: 7px 20px;
+    border-bottom: 1px solid var(--line-soft);
+    font-size: 11.5px;
+    line-height: 1.5;
+    color: var(--faint);
+  }
+  .capacity[hidden] { display: none; }
+  .capacity .cap-item { display: inline-flex; align-items: center; gap: 5px; }
+  .capacity b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+  .capacity .cap-item.is-full b { color: var(--amber); }
 
   .top-actions { flex: none; display: flex; align-items: center; gap: 12px; }
   .conn {
@@ -568,12 +586,22 @@
         <span class="count-label">今日完成</span>
         <span class="count-value" id="countDone">—</span>
       </div>
+      <div class="count" data-count="capacity" title="并发名额：同时在跑的任务数 / 上限（房间与项目分开算）">
+        <span class="count-label">并发</span>
+        <span class="count-value" id="countCapacity">—</span>
+      </div>
     </div>
     <div class="top-actions">
       <span class="conn" id="conn" aria-live="polite"><i class="dot"></i><span id="connText">连接中</span></span>
       <button type="button" class="btn" id="refreshBtn" title="立即刷新（每 5 秒也会自动刷新）">↻ 刷新</button>
     </div>
   </header>
+
+  <div class="capacity" id="capacityBar" aria-live="polite" hidden>
+    <span class="cap-item" id="capGlobalItem">全局 <b id="capGlobal">—</b></span>
+    <span class="cap-item" id="capRoomsItem">房间 <b id="capRooms">—</b></span>
+    <span class="cap-item" id="capProjectsItem">项目 <b id="capProjects">—</b></span>
+  </div>
 
   <div class="demo" id="demoBar" hidden>
     <strong>预览模式</strong>
@@ -687,6 +715,8 @@
     projects: [],
     rawCounts: null,
     counts: { running: 0, review: 0, blocked: 0, doneToday: 0 },
+    cap: null,
+    capacity: null,
     selectedKey: null,
     filterState: 'all',
     filterProject: '',
@@ -1101,6 +1131,42 @@
     els.countDone.textContent = show ? state.counts.doneToday : '—';
   }
 
+  /* T6：并发名额。used 是同时在跑（claimed/spawned/running/reported）的任务数，
+     cap 来自服务端 protocol.mjs（可用 DS_TEAMS_CAP_* 覆盖）。房间与项目各算各的桶，
+     全局额度管两者之和——所以三个数字对不上是正常的，不是算错。 */
+  function formatBuckets(map, cap) {
+    var keys = Object.keys(map || {}).sort();
+    var total = 0;
+    var parts = [];
+    for (var i = 0; i < keys.length; i++) {
+      var n = map[keys[i]] || 0;
+      total += n;
+      parts.push(String(keys[i]) + ' ' + n + '/' + cap);
+    }
+    var text = total + '/' + cap;
+    if (parts.length > 1) text += '（' + parts.join('，') + '）';
+    else if (parts.length === 1) text += '（' + parts[0] + '）';
+    return { text: text, full: cap > 0 && total >= cap };
+  }
+
+  function renderCapacity() {
+    if (!els.capacityBar) return;
+    var cap = state.cap;
+    var used = state.capacity;
+    var show = state.hadData && cap && used;
+    els.capacityBar.hidden = !show;
+    if (els.countCapacity) els.countCapacity.textContent = show ? (used.global || 0) + '/' + cap.global : '—';
+    if (!show) return;
+    var rooms = formatBuckets(used.rooms, cap.room);
+    var projects = formatBuckets(used.projects, cap.project);
+    els.capGlobal.textContent = (used.global || 0) + '/' + cap.global;
+    els.capGlobalItem.classList.toggle('is-full', cap.global > 0 && (used.global || 0) >= cap.global);
+    els.capRooms.textContent = rooms.text;
+    els.capRoomsItem.classList.toggle('is-full', rooms.full);
+    els.capProjects.textContent = projects.text;
+    els.capProjectsItem.classList.toggle('is-full', projects.full);
+  }
+
   function renderChips() {
     var derived = deriveCounts(state.tasks);
     var values = {
@@ -1482,6 +1548,7 @@
     var derived = deriveCounts(state.tasks);
     state.counts = resolveCounts(state.rawCounts, derived);
     renderCounts();
+    renderCapacity();
     renderChips();
     renderProjectSelect();
     renderList(force);
@@ -1534,6 +1601,8 @@
     state.projects = buildProjects(data.projects, tasks);
     state.tasks = sortTasks(tasks);
     state.rawCounts = data.counts || null;
+    state.cap = data.cap || null;
+    state.capacity = data.capacity || null;
     state.hadData = true;
     state.error = null;
     state.loading = false;
@@ -1965,6 +2034,14 @@
       countReview: document.getElementById('countReview'),
       countBlocked: document.getElementById('countBlocked'),
       countDone: document.getElementById('countDone'),
+      countCapacity: document.getElementById('countCapacity'),
+      capacityBar: document.getElementById('capacityBar'),
+      capGlobal: document.getElementById('capGlobal'),
+      capGlobalItem: document.getElementById('capGlobalItem'),
+      capRooms: document.getElementById('capRooms'),
+      capRoomsItem: document.getElementById('capRoomsItem'),
+      capProjects: document.getElementById('capProjects'),
+      capProjectsItem: document.getElementById('capProjectsItem'),
       conn: document.getElementById('conn'),
       connText: document.getElementById('connText'),
       refreshBtn: document.getElementById('refreshBtn'),

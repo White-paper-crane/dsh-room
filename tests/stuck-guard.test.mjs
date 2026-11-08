@@ -98,6 +98,20 @@ ok(lastSeqTimeFromLog(file) === T0 - 10_000, "lastSeqTimeFromLog picks newest se
 ok(lastSeqTimeFromLog(file, T0 - 100_000) === T0 - 10_000, "lastSeqTimeFromLog honours sinceMs");
 ok(lastSeqTimeFromLog(path.join(dir, "missing.log")) === 0, "missing log -> 0");
 
+// ⑭ 回归（2026-11-07）：同一条消息被 hold 重试 120 次、phase 一直 running 4 分钟 → 仍判 reset。
+//    事故根因：每次重试都刷新 lastHoldAt，decideStuck 的 jobAt 被顶到 now，判定恒为「还在动」。
+const b14 = createHoldBook();
+for (let i = 0; i < 120; i++) noteHold(b14, "session-stuck", 9001, "running", T0 - 4 * MIN + i * 2000);
+const r14 = decideStuck({ now: T0, holds: b14, activity: [{ id: "session-stuck", kind: "running", sinceMs: T0 - 4 * MIN, holds: b14.get("session-stuck").holds, lastSeqAt: 0 }] });
+ok(r14.action === "reset", "repeated retries of same seq -> still reset");
+
+// ⑮ 等待期间真来了新消息（seq 变了）→ 那是新活，计时窗口重新起算，不杀。
+const b15 = createHoldBook();
+noteHold(b15, "session-stuck", 9001, "running", T0 - 4 * MIN);
+noteHold(b15, "session-stuck", 9002, "running", T0 - 60_000);
+const r15 = decideStuck({ now: T0, holds: b15, activity: [{ id: "session-stuck", kind: "running", sinceMs: T0 - 4 * MIN, holds: b15.get("session-stuck").holds, lastSeqAt: 0 }] });
+ok(r15.action === "none", "new seq restarts the window");
+
 fs.rmSync(dir, { recursive: true, force: true });
 console.log(`\nstuck-guard: ${pass} pass / ${fail} fail`);
 process.exit(fail ? 1 : 0);

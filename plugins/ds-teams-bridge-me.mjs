@@ -8,6 +8,8 @@
 //   ④ kind=ack 一律不注入，只写日志 action=ack-log 并 ack；
 //   ⑤ claim 两端对称（CLIAM_ENABLED=true）：未点名/双点名 say 都可 claim（token 小者赢），
 //      输方 skip(reason=claimed-peer) 并 ack；赢方也写 claim 事件（v3 补齐 me 端旧的不对称——旧版赢时不写）；
+//      T4（2026-11-07）：claim 范围扩到 file / task / system（不是自己、也不是对端 agent 发的都算），
+//      这类卡片一律视为歧义直接声明——原来它们完全不过 claim，两端各注入一次（双投）；
 //   ⑥ 同一条消息被 hold 连续超 60s：另一端可 claim 接管注入（每 15s 扫一次，claim 范围扩到被 hold 超时的 say）；
 //   ⑦ 心跳/state 连续 3 tick 失败 → 写 error 日志并指数退避 2s→4s→8s…上限 30s，恢复后回 2s；
 //   ⑧ 保留 busy 看门狗（15s 复位、不取消 in-flight）、cooldown；CLI 侧差异：小满端只给附件提示不下载文件。
@@ -38,6 +40,11 @@ const { writeEnd, markEndArchived } = await import(pathToFileURL(path.join(ROOT,
 // BUG#2 自愈（2026-11-05）：会话 phase 长期 running 不收敛 → 桥永 hold，只有被对端 60s takeover 一条出路。
 // 判定放共享纯函数库（两端同一条判据），强停走宿主 agent.cancel({kind:"user"})。
 const { createHoldBook, noteHold, clearHold, settleHold, phaseKind, isBusyKind, lastSeqTimeFromLog, decideStuck, STUCK_MS } = await import(pathToFileURL(path.join(ROOT, "stuck-guard-lib.mjs")).href + "?v=" + Date.now());
+const { createHoldClock } = await import(pathToFileURL(path.join(ROOT, "hold-lib.mjs")).href + "?v=" + Date.now());
+// T5（2026-11-07）：闸门拒绝后的房内说明文案，放共享纯函数库，两端同一份、同一幂等键。
+const { noticeFor } = await import(pathToFileURL(path.join(ROOT, "wake-notice-lib.mjs")).href + "?v=" + Date.now());
+// T4（2026-11-07）：claim 适用范围——file / task / system 也要 claim，否则两端各注入一次（双投）。
+const { shouldClaim } = await import(pathToFileURL(path.join(ROOT, "claim-scope-lib.mjs")).href + "?v=" + Date.now());
 
 export const name = "ds-teams-bridge-me";
 export const inject = ["agents", "timer", "workspaceController", "workspaceRegistry"];
@@ -128,6 +135,8 @@ export function apply(ctx) {
   const lastInjectByRoom = new Map();
   // C6（BUG#2 2026-11-05）：按会话记「被 hold 在 busy」的起止，供卡死自愈判定；+ 房内最后一条对端消息时间。
   const holdBook = createHoldBook();
+  // A11（2026-11-08）：同一条消息被 hold 多久了；超过上限就放弃这一轮注入并 ack。
+  const holdClock = createHoldClock();
   const roomLastPeerAt = new Map();
   const lastRoomPeerAt = (roomId) => roomLastPeerAt.get(String(roomId)) || 0;
   let lastArch = 0;
@@ -241,8 +250,44 @@ export function apply(ctx) {
       return { ok: r.ok, status: r.status };
     } catch (e) { return { ok: false, error: String((e && e.message) ?? e).slice(0, 120) }; }
   };
-  const serverAckCursor = (s, who) => {
+  // T5（2026-11-07）：闸门拒了不能静默。原实现允许「预算/上下文超限」直接当已处理（ack + 0 注入），
+  // 房里看不到任何解释，群主只能猜为什么没人回。这里补一条说明，按「房 + 原因 + 日期」幂等：
+  // 服务端 /say 只认 text 种别（body.kind 会被忽略），所以用 text + 【自动提示】前缀；
+  // msgId 走服务端幂等（同一 msgId 每房只落一条），重启后也不会重复。
+  const postNotice = async (roomId, reason, seq) => {
+    const { text, msgId } = noticeFor(reason, seq);
     try {
+      const r = await fetch(`${base()}/api/rooms/${encodeURIComponent(roomId)}/say?k=${encodeURIComponent(platKey())}`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ who: WHO, key: memberKey(WHO), text, msgId }),
+        signal: AbortSignal.timeout(3000),
+      });
+      if (!r.ok) { log(`wake blocked notice failed status=${r.status}`); return false; }
+      const j = await r.json().catch(() => null);
+      evt({ action: "wake-blocked-notice", room: roomId, reason, seq, msgSeq: (j && j.message && j.message.seq) || null });
+      return true;
+    } catch (e) {
+      log("wake blocked notice error " + String((e && e.message) ?? e).slice(0, 120));
+      return false;
+    }
+  };
+  // A11（2026-11-08）：hold 超时后要在房里说一句「先放下了」。这里没有 postSay，
+  // 直接用 /say 落一条 text（和自己回话同一个身份）。
+  const sayText = async (roomId, text) => {
+    try {
+      const r = await fetch(`${base()}/api/rooms/${encodeURIComponent(roomId)}/say?k=${encodeURIComponent(platKey())}`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ who: WHO, key: memberKey(WHO), text }),
+        signal: AbortSignal.timeout(3000),
+      });
+      if (!r.ok) { log(`hold give-up notice failed status=${r.status}`); return false; }
+      return true;
+    } catch (e) {
+      log("hold give-up notice error " + String((e && e.message) ?? e).slice(0, 120));
+      return false;
+    }
+  };
+  const serverAckCursor = (s, who) => {    try {
       const obj = s && (s.acks || s.cursors || s.ackSeqs);
       if (obj && typeof obj === "object" && !Array.isArray(obj) && typeof obj[who] === "number" && Number.isFinite(obj[who])) return obj[who];
       if (s && typeof s.ackSeq === "number" && Number.isFinite(s.ackSeq)) return s.ackSeq;
@@ -634,10 +679,13 @@ export function apply(ctx) {
       return true;
     }
     // 2026-11-05：以前只把超管的话当「用户聊天」，受邀成员的发言既不 claim 也不回。
-    const isUserChat = m.who !== WHO && m.who !== PEER && m.who !== "system" && isSayKind(m);
+    // T4（2026-11-07）：claim 范围扩到「不是自己、也不是对端 agent 发的」全部消息——
+    // 以前 file / task / system 卡片两端都不 claim，同一张图、同一张任务卡被各注入一次（双投）。
+    const claimRelevant = m.who !== WHO && m.who !== PEER;
+    const claimNow = () => shouldClaim(m, { who: WHO, peer: PEER, ambiguous: isAmbiguousMsg(m) });
     // ② 已有 claim 裁决（可能是我 hold 期间对方接管了）：对方赢 → skip(claimed-peer) 并 ack。
     let claimMine = false;
-    if (isUserChat) {
+    if (claimRelevant) {
       const st0 = await claimGet(m.roomId, m.seq);
       if (st0?.winner && st0.winner !== WHO) {
         evtOnce("claim:" + m.seq, { action: "skip", seq: m.seq, room: m.roomId, reason: "claimed-peer", winner: st0.winner });
@@ -656,7 +704,19 @@ export function apply(ctx) {
     const phKind = phaseKind(ag);
     if (isBusyKind(phKind)) {
       noteHold(holdBook, sid, m.seq, phKind);
+      holdClock.mark("busy:" + m.seq);
       evtOnce("hold:" + m.seq + ":busy:" + phKind, { action: "hold", seq: m.seq, room: m.roomId, kind: m.kind, reason: "busy:" + phKind, sessionId: sid });
+      // A11（2026-11-08）：忙太久就把这条先放下（消息还在房历史里），ack 推游标；
+      // 否则长任务期间的每条消息都要冻到任务结束。
+      if (holdClock.expired("busy:" + m.seq)) {
+        const waitedMin = Math.max(1, Math.round((Date.now() - holdClock.at("busy:" + m.seq)) / 60000));
+        evt({ action: "hold-give-up", seq: m.seq, room: m.roomId, reason: "busy:" + phKind, waitedMin });
+        log(`busy(${phKind}) give up #${m.seq} after ${waitedMin}min`);
+        await sayText(m.roomId, `我这边还在忙（${phKind}），消息 #${m.seq} 等了 ${waitedMin} 分钟，先放下了；忙完我用 read 回看房间历史。`);
+        holdClock.clear("busy:" + m.seq);
+        settleHold(holdBook, sid, m.seq);
+        return true; // ack：游标往前走，不再为这一条无限 hold
+      }
       log(`busy(${phKind}) hold #${m.seq}`);
       return false;
     }
@@ -666,7 +726,7 @@ export function apply(ctx) {
       return false;
     }
     // ⑥ claim 声明（契约 §2.5/§3.5）：v3 两端对称——歧义/接管时 POST，赢也写 claim 事件。
-    if (isUserChat && CLAIM_ENABLED && !claimMine && !claimedSeq.has(m.seq) && (isAmbiguousMsg(m) || opts.takeover)) {
+    if (claimRelevant && CLAIM_ENABLED && !claimMine && !claimedSeq.has(m.seq) && (claimNow() || opts.takeover)) {
       claimedSeq.add(m.seq);
       if (claimedSeq.size > 1000) { let n = 0; for (const k of claimedSeq) { claimedSeq.delete(k); if (++n >= 500) break; } }
       const posted = await claimPost(m.roomId, m.seq);
@@ -701,6 +761,8 @@ export function apply(ctx) {
         const reason = String(am.reason || (am.ok === false ? "REJECTED" : "COUNT"));
         evt({ action: "wake-blocked", reason, seq: m.seq, room: m.roomId, kind: m.kind, who: m.who });
         log(`wake blocked #${m.seq} reason=${reason}`);
+        // T5：说一声再放下（幂等，同房同原因每天一条）
+        await postNotice(m.roomId, reason, m.seq);
         return true;
       }
       if (!am.allow) {
@@ -750,6 +812,7 @@ export function apply(ctx) {
     lastInject = Date.now();
     lastInjectByRoom.set(m.roomId, lastInject);
     clearHold(holdBook, sid);   // BUG#2：这份账等的东西已经投进去了
+    holdClock.clear("busy:" + m.seq);   // A11：hold 计时作废
     log(`inject seq=${m.seq} room=${m.roomId} kind=${m.kind}`);
     evt({ action: "inject", seq: m.seq, room: m.roomId, kind: m.kind, who: m.who, taskId: m.taskId || "", takeover: !!opts.takeover, floodSkipped: opts.floodSkipped || 0, wakeId });
     if (wakeId) startWakeWatch(wakeId, m.seq, m.roomId);   // 契约 §6：注入成功 → 启动 outcome watcher
@@ -837,7 +900,7 @@ export function apply(ctx) {
             kind: x.kind,
             sinceMs: b?.firstBusyAt || 0,
             holds: b?.holds || 0,
-            lastSeqAt: logT ? Math.max(logT, b?.lastHoldAt || 0) : (b?.lastHoldAt || 0),
+            lastSeqAt: logT || 0,   // 只认桥事件日志里的真进展；hold 重试不算（2026-11-07）
           };
         }),
         lastRoomAt: lastRoomPeerAt,

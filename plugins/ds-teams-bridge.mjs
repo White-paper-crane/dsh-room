@@ -8,6 +8,8 @@
 //   ④ kind=ack 一律不注入，只写日志 action=ack-log 并 ack；
 //   ⑤ claim 两端对称（CLIAM_ENABLED=true）：未点名/双点名 say 都可 claim（token 小者赢），
 //      输方 skip(reason=claimed-peer) 并 ack；赢方也写 claim 事件（v3 补齐 me 端旧的不对称）；
+//      T4（2026-11-07）：claim 范围扩到 file / task / system（不是自己、也不是对端 agent 发的都算），
+//      这类卡片一律视为歧义直接声明——原来它们完全不过 claim，两端各注入一次（双投）；
 //   ⑥ 同一条消息被 hold 连续超 60s：另一端可 claim 接管注入（每 15s 扫一次，claim 范围扩到被 hold 超时的 say）；
 //   ⑦ 心跳/state 连续 3 tick 失败 → 写 error 日志并指数退避 2s→4s→8s…上限 30s，恢复后回 2s；
 //   ⑧ 保留 busy 看门狗（15s 复位、不取消 in-flight）、cooldown、附件下载、stall 报警、dispatch 台账维护。
@@ -33,13 +35,18 @@ const SESS_CWD = process.env.DS_TEAMS_WORKSPACE || path.resolve(ROOT, "..");
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
 // 动态 import + 时间戳：宿主会缓存同 URL 的 dispatch-lib，改了导出不重启就拿到旧模块（2026-11-03 事故）。
 // v3 只用台账维护 watchdog/promote；任务卡路由判定已内联（两端对称），不再依赖 isTaskForDaman。
-const { watchdog, promote } = await import(pathToFileURL(path.join(ROOT, "dispatch-lib.mjs")).href + "?v=" + Date.now());
+const { watchdog, promote, claimedAwaitingSpawn, clearNudge } = await import(pathToFileURL(path.join(ROOT, "dispatch-lib.mjs")).href + "?v=" + Date.now());
 // B1（2026-11-04）：房会话台账写库（与小满端共用 room-session-lib.mjs）。
 // B2（2026-11-04）：endOpts = 台账叶子 provider/model 覆盖的纯函数（按角色分模型）。
 const { writeEnd, markEndArchived, endOpts } = await import(pathToFileURL(path.join(ROOT, "room-session-lib.mjs")).href + "?v=" + Date.now());
 // BUG#2 自愈（2026-11-05）：会话 phase 长期 running 不收敛 → 桥永 hold，只有被对端 60s takeover 一条出路。
 // 判定放共享纯函数库（两端同一条判据，与 ds-teams-bridge-me.mjs 对称）。
 const { createHoldBook, noteHold, clearHold, settleHold, phaseKind, isBusyKind, lastSeqTimeFromLog, decideStuck } = await import(pathToFileURL(path.join(ROOT, "stuck-guard-lib.mjs")).href + "?v=" + Date.now());
+const { createHoldClock, HOLD_MAX_MS } = await import(pathToFileURL(path.join(ROOT, "hold-lib.mjs")).href + "?v=" + Date.now());
+// T5（2026-11-07）：闸门拒绝后的房内说明文案，放共享纯函数库，两端同一份、同一幂等键。
+const { noticeFor } = await import(pathToFileURL(path.join(ROOT, "wake-notice-lib.mjs")).href + "?v=" + Date.now());
+// T4（2026-11-07）：claim 适用范围——file / task / system 也要 claim，否则两端各注入一次（双投）。
+const { shouldClaim } = await import(pathToFileURL(path.join(ROOT, "claim-scope-lib.mjs")).href + "?v=" + Date.now());
 
 export const name = "ds-teams-bridge";
 export const inject = ["agents", "timer", "workspaceController"];
@@ -138,6 +145,8 @@ export function apply(ctx) {
   const lastInjectByRoom = new Map();
   // C6（BUG#2 2026-11-05）：按会话记「被 hold 在 busy」的起止，供卡死自愈判定；+ 房内最后一条对端消息时间。
   const holdBook = createHoldBook();
+  // A11（2026-11-08）：同一条消息被 hold 多久了；超过 HOLD_MAX_MS 就放弃这一轮注入并 ack。
+  const holdClock = createHoldClock();
   const roomLastPeerAt = new Map();
   const lastRoomPeerAt = (roomId) => roomLastPeerAt.get(String(roomId)) || 0;
   let lastMaint = 0;
@@ -266,6 +275,27 @@ export function apply(ctx) {
       });
       return { ok: r.ok, status: r.status };
     } catch (e) { return { ok: false, error: String((e && e.message) ?? e).slice(0, 120) }; }
+  };
+  // T5（2026-11-07）：闸门拒了不能静默。原实现「预算/上下文超限」直接当已处理（ack + 0 注入），
+  // 房里看不到任何解释。这里补一条说明，按「房 + 原因 + 日期」幂等：
+  // 服务端 /say 只认 text 种别（body.kind 会被忽略），所以用 text + 【自动提示】前缀；
+  // msgId 走服务端幂等（同一 msgId 每房只落一条），重启后也不会重复。
+  const postNotice = async (roomId, reason, seq) => {
+    const { text, msgId } = noticeFor(reason, seq);
+    try {
+      const r = await fetch(`${base()}/api/rooms/${encodeURIComponent(roomId)}/say?k=${encodeURIComponent(platKey())}`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ who: WHO, key: memberKey(WHO), text, msgId }),
+        signal: AbortSignal.timeout(3000),
+      });
+      if (!r.ok) { log(`wake blocked notice failed status=${r.status}`); return false; }
+      const j = await r.json().catch(() => null);
+      evt({ action: "wake-blocked-notice", room: roomId, reason, seq, msgSeq: (j && j.message && j.message.seq) || null });
+      return true;
+    } catch (e) {
+      log("wake blocked notice error " + String((e && e.message) ?? e).slice(0, 120));
+      return false;
+    }
   };
   // 服务端 ack 游标（防御性读取）：v3 状态响应若暴露 acks/cursors/ackSeqs 就用它兜底本地文件。
   const serverAckCursor = (s, who) => {
@@ -677,10 +707,13 @@ export function apply(ctx) {
       return true;
     }
     // 2026-11-05：以前只把超管的话当「用户聊天」，受邀成员的发言既不 claim 也不回。
-    const isUserChat = m.who !== WHO && m.who !== PEER && m.who !== "system" && isSayKind(m);
+    // T4（2026-11-07）：claim 范围扩到「不是自己、也不是对端 agent 发的」全部消息——
+    // 以前 file / task / system 卡片两端都不 claim，同一张图、同一张任务卡被各注入一次（双投）。
+    const claimRelevant = m.who !== WHO && m.who !== PEER;
+    const claimNow = () => shouldClaim(m, { who: WHO, peer: PEER, ambiguous: isAmbiguousMsg(m) });
     // ② 已有 claim 裁决（可能是我 hold 期间对方接管了，契约 §2.5/§3.6）：对方赢 → skip(claimed-peer) 并 ack。
     let claimMine = false;
-    if (isUserChat) {
+    if (claimRelevant) {
       const st0 = await claimGet(m.roomId, m.seq);
       if (st0?.winner && st0.winner !== WHO) {
         evtOnce("claim:" + m.seq, { action: "skip", seq: m.seq, room: m.roomId, reason: "claimed-peer", winner: st0.winner });
@@ -700,7 +733,19 @@ export function apply(ctx) {
     const phKind = phaseKind(ag);
     if (isBusyKind(phKind)) {
       noteHold(holdBook, sid, m.seq, phKind);
+      holdClock.mark("busy:" + m.seq);
       evtOnce("hold:" + m.seq + ":busy:" + phKind, { action: "hold", seq: m.seq, room: m.roomId, kind: m.kind, reason: "busy:" + phKind, sessionId: sid });
+      // A11（2026-11-08）：忙太久就把这条先放下（消息还在房历史里，不会丢），ack 推游标；
+      // 否则一个长任务期间的每条消息都要冻到任务结束，恢复后一口气全灌进来。
+      if (holdClock.expired("busy:" + m.seq)) {
+        const waitedMin = Math.max(1, Math.round((Date.now() - holdClock.at("busy:" + m.seq)) / 60000));
+        evt({ action: "hold-give-up", seq: m.seq, room: m.roomId, reason: "busy:" + phKind, waitedMin });
+        log(`busy(${phKind}) give up #${m.seq} after ${waitedMin}min`);
+        await postSay(m.roomId, `我这边还在忙（${phKind}），消息 #${m.seq} 等了 ${waitedMin} 分钟，先放下了；忙完我用 read 回看房间历史。`);
+        holdClock.clear("busy:" + m.seq);
+        settleHold(holdBook, sid, m.seq);
+        return true; // ack：游标往前走，不再为这一条无限 hold
+      }
       log(`busy(${phKind}) hold #${m.seq}`);
       return false;
     }
@@ -710,7 +755,7 @@ export function apply(ctx) {
       return false;
     }
     // ⑥ claim 声明（用户聊天，契约 §2.5/§3.5）：歧义（都点名/都不点名）或接管时 POST；直接点名我不占声明。
-    if (isUserChat && CLAIM_ENABLED && !claimMine && !claimedSeq.has(m.seq) && (isAmbiguousMsg(m) || opts.takeover)) {
+    if (claimRelevant && CLAIM_ENABLED && !claimMine && !claimedSeq.has(m.seq) && (claimNow() || opts.takeover)) {
       claimedSeq.add(m.seq);
       if (claimedSeq.size > 1000) { let n = 0; for (const k of claimedSeq) { claimedSeq.delete(k); if (++n >= 500) break; } }
       const posted = await claimPost(m.roomId, m.seq);
@@ -746,6 +791,8 @@ export function apply(ctx) {
         const reason = String(am.reason || (am.ok === false ? "REJECTED" : "COUNT"));
         evt({ action: "wake-blocked", reason, seq: m.seq, room: m.roomId, kind: m.kind, who: m.who });
         log(`wake blocked #${m.seq} reason=${reason}`);
+        // T5：说一声再放下（幂等，同房同原因每天一条）
+        await postNotice(m.roomId, reason, m.seq);
         return true;
       }
       if (!am.allow) {
@@ -796,6 +843,7 @@ export function apply(ctx) {
     lastInject = Date.now();
     lastInjectByRoom.set(m.roomId, lastInject);
     clearHold(holdBook, sid);   // BUG#2：这份账等的东西已经投进去了
+    holdClock.clear("busy:" + m.seq);   // A11：hold 计时作废
     log(`inject seq=${m.seq} room=${m.roomId} kind=${m.kind}`);
     evt({ action: "inject", seq: m.seq, room: m.roomId, kind: m.kind, who: m.who, taskId: m.taskId || "", takeover: !!opts.takeover, floodSkipped: opts.floodSkipped || 0, wakeId });
     // 2026-11-03 19:28 静默卡死报警：注入后 3 分钟我在该房间仍没回过任何话，
@@ -815,31 +863,34 @@ export function apply(ctx) {
   };
 
   // promote 之后叫醒我：这一步必须在回合里做 spawn，桥接只负责提醒，不自己拉人。
+  // A2（2026-11-08）：返回值区分「送到了 / 可以马上重试 / 被闸门拦下」——
+  // 以前送没送到都吞掉，而 nudgedAt 在取出时已经打上，提醒一丢就要干等 5 分钟 TTL，
+  // claimed 卡到 15 分钟看门狗上直接变 timeout。现在 retry 时调用方立刻 clearNudge，15 秒后重试。
   const nudgePromoted = async (keys) => {
     try {
       const ag = await liveAgent(meSessionId());
-      if (!ag || typeof ag.followup !== "function") { log("promote nudge: no agent"); return; }
+      if (!ag || typeof ag.followup !== "function") { log("promote nudge: no agent"); return "retry"; }
       const ph = ag.phase;
       const kind = typeof ph === "object" && ph ? String(ph.kind ?? "") : String(ph ?? "");
-      if (kind && kind !== "idle" && kind !== "waiting" && kind !== "completed") { log("promote nudge hold phase=" + kind); return; }
+      if (kind && kind !== "idle" && kind !== "waiting" && kind !== "completed") { log("promote nudge hold phase=" + kind); return "retry"; }
       // 契约 §6：promote nudge 也是唤醒（一次 followup = 一个 turn），先过闸再注入（seq:-1、kind:"nudge"）。
       const adm = await wakeAdmit(-1, "", "nudge");
       if (!adm.ok) {
         evtOnce("wake-admit-fail:nudge", { action: "wake-admit-fail", seq: -1, kind: "nudge", status: adm.status, message: adm.error });
         log("promote nudge admit failed" + (adm.status ? ` status=${adm.status}` : " (net)"));
-        return;
+        return adm.status ? "blocked" : "retry";
       }
       const am = adm.adm || {};
       if (am.ok === false || am.allow === false) {
         const reason = String(am.reason || (am.ok === false ? "REJECTED" : "COUNT"));
         evt({ action: "wake-blocked", reason, seq: -1, room: "", kind: "nudge", who: WHO });
         log("promote nudge blocked reason=" + reason);
-        return;
+        return "blocked";
       }
       if (!am.allow) {
         evtOnce("wake-admit-fail:nudge", { action: "wake-admit-fail", seq: -1, kind: "nudge", message: "bad admit body" });
         log("promote nudge admit bad body");
-        return;
+        return "blocked";
       }
       const wakeId = String(am.wakeId || "");
       const failSettle = (e) => {
@@ -852,11 +903,12 @@ export function apply(ctx) {
           source: { kind: "plugin:ds-teams" },
         }));
         if (p && typeof p.catch === "function") p.catch(failSettle);
-      } catch (e) { failSettle(e); return; }
+      } catch (e) { failSettle(e); return "retry"; }
       evt({ action: "nudge", count: keys.length, wakeId, seq: -1 });
       if (wakeId) startWakeWatch(wakeId, -1, "");
       log("promote nudge -> " + keys.length);
-    } catch (e) { log("promote nudge failed " + String((e && e.message) ?? e)); }
+      return "sent";
+    } catch (e) { log("promote nudge failed " + String((e && e.message) ?? e)); return "retry"; }
   };
 
   // 接管扫描（契约 §2.5/§3.6）：每 15s 一次，找「只点对方、>60s、对方没 ack 也没回话、无 claim 裁决」的 say，
@@ -939,7 +991,7 @@ export function apply(ctx) {
             kind: x.kind,
             sinceMs: b?.firstBusyAt || 0,
             holds: b?.holds || 0,
-            lastSeqAt: logT ? Math.max(logT, b?.lastHoldAt || 0) : (b?.lastHoldAt || 0),
+            lastSeqAt: logT || 0,   // 只认桥事件日志里的真进展；hold 重试不算（2026-11-07）
           };
         }),
         lastRoomAt: lastRoomPeerAt,
@@ -1052,7 +1104,20 @@ export function apply(ctx) {
           const wd = watchdog();
           if (wd.length) log("watchdog timeout " + wd.map((x) => x.key + "(" + x.reason + ")").join(", "));
           const promoted = promote();
-          if (promoted.length) { log("promote " + promoted.join(", ")); await nudgePromoted(promoted); }
+          // T2（2026-11-07）：promote 只管队列状态；已 claimed 但没人去 spawn 的同样要提醒，
+          // 否则那条提醒一旦丢了，任务就一直挂着直到看门狗判 timeout。
+          // A12（2026-11-08）：带上本端名，接管给对端的卡不提醒我（否则两端各跑一遍）。
+          const waiting = claimedAwaitingSpawn(WHO);
+          const nudges = Array.from(new Set([...promoted, ...waiting]));
+          if (nudges.length) {
+            log("promote " + nudges.join(", ") + (waiting.length ? " (await-spawn " + waiting.length + ")" : ""));
+            const r = await nudgePromoted(nudges);
+            // A2（2026-11-08）：提醒没送到就立刻还账，下一轮重试；闸门明确拒绝才按 TTL 等。
+            if (r !== "sent") {
+              if (r === "retry") for (const k of nudges) clearNudge(k);
+              log("nudge " + r + ": " + nudges.join(", "));
+            }
+          }
         } catch (e) { log("maint failed " + String((e && e.message) ?? e)); }
       }
       // ⑦ 逐条处理 pending：flood(只 say) → relevant → ack-kind → 白名单 → deliver。

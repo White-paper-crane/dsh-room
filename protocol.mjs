@@ -50,9 +50,12 @@ export const TERMINAL = new Set(["done", "failed", "timeout", "aborted", "interr
 export const CLOSED = new Set(["done", "aborted", "reviewed", "failed"]);
 
 export const LIMITS = Object.freeze({
-  maxActiveTasks: 3,
-  maxActiveTasksPerRoom: 2,
-  burstLimit: 5,
+  // T6（2026-11-07）：并发上限不再写死，环境变量可调（默认值与历史一致）。
+  // 房间任务与项目任务分两个桶，全局额度仍管两者之和。
+  maxActiveTasks: envInt("DS_TEAMS_CAP_GLOBAL", 3),
+  maxActiveTasksPerRoom: envInt("DS_TEAMS_CAP_ROOM", 2),
+  maxActiveTasksPerProject: envInt("DS_TEAMS_CAP_PROJECT", 2),
+  burstLimit: envInt("DS_TEAMS_BURST_LIMIT", 5),
   claimWaitMs: 2000,
   claimRetention: 200,
   // 体检告警阈值，不是服务端过期时间：claim 记录只按 target 数保留，不随时间删除。
@@ -67,6 +70,10 @@ export const LIMITS = Object.freeze({
   takeoverAfterMs: 900_000,
   // 接管条件：任务 claimedAt 早于该阈值（毫秒）才移交，避免刚接的活被抢。
   takeoverClaimMinMs: 15 * 60_000,
+  // A12（2026-11-08）：光看 claimedAt 会把「刚接活但在忙」的卡也转走，两端各跑一遍。
+  // 转卡还要求最近 takeoverStaleMs 内没有任何进度信号，且这张卡 takeoverCooldownMs 内没被转过。
+  takeoverStaleMs: 5 * 60e3,
+  takeoverCooldownMs: 30 * 60_000,
 
   // v3 房间记忆：单条文本上限（字符）与每房保留条数。
   memoryMaxText: 2000,
@@ -80,6 +87,18 @@ function envNum(name, dflt) {
   if (raw === undefined || raw === null || String(raw).trim() === "") return dflt;
   const n = Number(raw);
   return Number.isFinite(n) && n >= 0 ? n : dflt;
+}
+
+// 整数型环境变量：非数字、负数、越界一律退回默认值，不让配置把服务端搞挂。
+function envInt(name, dflt, { min = 1, max = 64 } = {}) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === null || String(raw).trim() === "") return dflt;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return dflt;
+  const i = Math.floor(n);
+  if (i < min) return min;
+  if (i > max) return max;
+  return i;
 }
 
 export const WAKE = Object.freeze({
@@ -106,6 +125,7 @@ export const MEETING_VERDICT_SET = new Set(MEETING.verdicts);
 export const CAP = Object.freeze({
   global: LIMITS.maxActiveTasks,
   room: LIMITS.maxActiveTasksPerRoom,
+  project: LIMITS.maxActiveTasksPerProject,
 });
 
 export const CLAIM = Object.freeze({
@@ -136,7 +156,7 @@ function textDescription() {
     `roles      ${ROLES.join(" / ")}（owner=${OWNER}）`,
     `messages   ${MESSAGE_KINDS.join(" ")}（system/patrol 内部）`,
     `states     ${TASK_STATES.join(" ")}`,
-    `active     ${[...ACTIVE].join(" ")}（global ${CAP.global} / room ${CAP.room}）`,
+    `active     ${[...ACTIVE].join(" ")}（global ${CAP.global} / room ${CAP.room} / project ${CAP.project}）`,
     `terminal   ${[...TERMINAL].join(" ")}`,
     `closed     ${[...CLOSED].join(" ")}（台账）`,
     `limits     burst=${LIMITS.burstLimit} claimWait=${LIMITS.claimWaitMs}ms claimRetention=${LIMITS.claimRetention} maxAttempts=${LIMITS.maxAttempts}`,

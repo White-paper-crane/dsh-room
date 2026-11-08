@@ -6,9 +6,10 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createProjectSpace } from "./projects.mjs";
-import { acceptTask, controlCounts, createTask, listTasks, readLedger as dispatchReadLedger, rejectTask, writeLedger as dispatchWriteLedger } from "./dispatch-lib.mjs";
+import { acceptTask, controlCounts, counts as dispatchCounts, createTask, listTasks, promote as dispatchPromote, readLedger as dispatchReadLedger, rejectTask, watchdog as dispatchWatchdog, writeLedger as dispatchWriteLedger } from "./dispatch-lib.mjs";
 import { buildHealth } from "./scripts/health-lib.mjs";
-import { ACTIVE, AUTH, BRIDGE_ENDS, CLOSED, LIMITS, MEETING, MESSAGE_KINDS, MESSAGE_KIND_SET, MEETING_VERDICT_SET, OWNER, ROLES, SUBSTANTIVE_KINDS, WAKE_OUTCOMES, WAKE_OUTCOME_SET } from "./protocol.mjs";
+import { applyTakeover, decideTakeovers } from "./takeover-lib.mjs";
+import { ACTIVE, AUTH, BRIDGE_ENDS, CAP, CLOSED, LIMITS, MEETING, MESSAGE_KINDS, MESSAGE_KIND_SET, MEETING_VERDICT_SET, OWNER, ROLES, SUBSTANTIVE_KINDS, WAKE_OUTCOMES, WAKE_OUTCOME_SET } from "./protocol.mjs";
 import { admit as wakeAdmit, bridgeWake, getState as wakeGetState, readState as wakeReadState, settle as wakeSettle, sweepStale as wakeSweepStale } from "./wake-lib.mjs";
 import { abortRoom as meetingAbortRoom, list as meetingList, onSilence as meetingOnSilence, open as meetingOpen, respond as meetingRespond } from "./meeting-lib.mjs";
 import { patchSettings, readSettings } from "./settings-lib.mjs";
@@ -982,10 +983,25 @@ function watchBackend() {
   if (!on) return;
   console.log("[hot] --watch 已开：改 *.mjs 会自动重启（run-server.cmd 守护）");
   let timer = null;
+  // 基线：启动时各 .mjs 的 mtime。Windows 上 fs.watch 会送幻影事件（读文件、杀毒扫描、
+  // 同步盘回写都会触发），mtime 没真变就不重启——否则跑测试时会把自己的服务重启掉。
+  const base = new Map();
+  try {
+    for (const f of fs.readdirSync(ROOT)) {
+      if (!/\.mjs$/i.test(f)) continue;
+      try { base.set(f, fs.statSync(path.join(ROOT, f)).mtimeMs); } catch {}
+    }
+  } catch (error) {
+    console.error("[hot] 基线扫描失败：", error.message);
+  }
   try {
     fs.watch(ROOT, { persistent: false }, (_, filename) => {
       const name = String(filename || "");
       if (!/\.mjs$/i.test(name)) return;
+      let mtime = 0;
+      try { mtime = fs.statSync(path.join(ROOT, name)).mtimeMs; } catch { return; } // 删掉的文件不重启
+      if (base.get(name) === mtime) return; // 幻影事件：mtime 没变
+      base.set(name, mtime);
       clearTimeout(timer);
       // 先把 reload 推给页面再退，省得它等重连；守护脚本会重新拉起进程。
       timer = setTimeout(() => {
@@ -1397,7 +1413,8 @@ const server = http.createServer(async (req, res) => {
     const tasks = listTasks({ projectId: project, all: true });
     const projects = [...new Set(tasks.map((t) => t.projectId).filter(Boolean))]
       .map((id) => ({ id, title: id }));
-    return json(res, 200, { ok: true, now: new Date().toISOString(), projects, counts: controlCounts(), tasks });
+    // cap / capacity：并发名额的「上限」与「用了多少」，房间与项目分开算（T6）。
+    return json(res, 200, { ok: true, now: new Date().toISOString(), projects, counts: controlCounts(), cap: CAP, capacity: dispatchCounts(), tasks });
   }
 
   if (p === "/api/control/task" && req.method === "POST") {
@@ -2259,40 +2276,26 @@ function bridgeDown(now) {
   }
   return down;
 }
+// A12（2026-11-08）：判据抽到 takeover-lib（纯函数，可测）。旧版只看 claimedAt 超 15 分钟，
+// 忙端刚接的活也会被转走，那一端回来后两端各跑一遍。现在还要「近 5 分钟没进度」且「30 分钟内没转过」。
 function takeoverPass(now) {
   const down = bridgeDown(now);
-  const from = down.me && !down.daman ? "me" : !down.me && down.daman ? "daman" : "";
-  if (!from) return; // 双端都 down 或都正常：不动作
-  const to = from === "me" ? "daman" : "me";
   const ledger = dispatchReadLedger();
   const tasks = (ledger && ledger.tasks) || {};
-  let changed = false;
-  for (const key of Object.keys(tasks)) {
-    const e = tasks[key];
-    if (!e || typeof e !== "object") continue;
-    if (e.assignee !== from) continue;
-    if (!ACTIVE.has(e.state)) continue;
-    const claimedAt = Date.parse(e.claimedAt || "");
-    if (!Number.isFinite(claimedAt) || now - claimedAt <= LIMITS.takeoverClaimMinMs) continue;
-    const title = String(e.title || e.taskId || key);
-    e.assignee = to;
-    e.updatedAt = new Date(now).toISOString();
-    // 与 dispatch-lib pushEvent 同构的台账事件；events 上限 200。
-    const events = Array.isArray(e.events) ? e.events : [];
-    events.push({ at: new Date(now).toISOString(), type: "takeover", by: "system", detail: `${from} -> ${to}: ${title}`.slice(0, 500) });
-    e.events = events.slice(-200);
-    changed = true;
+  const moves = decideTakeovers({ now, down, tasks, limits: LIMITS });
+  if (!moves.length) return;
+  for (const mv of moves) {
+    const e = tasks[mv.key];
+    applyTakeover(e, { ...mv, now });
     const r = room(e.roomId);
     if (r && r.status === "open") {
-      const fromName = (PERSONAS[from] && PERSONAS[from].name) || (MEMBERS[from] && MEMBERS[from].name) || from;
-      const toName = (PERSONAS[to] && PERSONAS[to].name) || (MEMBERS[to] && MEMBERS[to].name) || to;
-      push(r.id, "system", "system", `⚠️ ${fromName}掉线，任务「${title}」转给${toName}`);
+      const fromName = (PERSONAS[mv.from] && PERSONAS[mv.from].name) || (MEMBERS[mv.from] && MEMBERS[mv.from].name) || mv.from;
+      const toName = (PERSONAS[mv.to] && PERSONAS[mv.to].name) || (MEMBERS[mv.to] && MEMBERS[mv.to].name) || mv.to;
+      push(r.id, "system", "system", `⚠️ ${fromName}掉线，任务「${mv.title}」转给${toName}`);
     }
   }
-  if (changed) {
-    try { dispatchWriteLedger(ledger); } catch (e) { console.error("takeover writeLedger", e.message); }
-    save();
-  }
+  try { dispatchWriteLedger(ledger); } catch (e) { console.error("takeover writeLedger", e.message); }
+  save();
 }
 // wake 兜底回收用的消息视图：活房从 db 取，已归档房从 data/archive/<id>.json 取。
 function roomMessagesForWake(roomId) {
@@ -2357,6 +2360,28 @@ function patrolOnce(now = Date.now()) {
   flush();
 }
 setInterval(() => { try { patrolOnce(); } catch (e) { console.error("patrol", e.message); } }, PATROL_MS).unref();
+
+/* ---------- 台账维护（T1 2026-11-07）----------
+ * 以前 promote/watchdog 只活在大满端桥的 15 秒 tick 里：桌面端不开，新任务永远 queued，
+ * 房间看着「在干活」其实队列没动。这里让服务自己每 5 秒跑一次：
+ *   watchdog 先把超时的标掉（名额随之放出），promote 再把 queued 提到 claimed。
+ * 提醒 agent 去 spawn 仍然只能由桥做（服务端注入不了宿主会话），桥那边捞的是
+ * claimedAwaitingSpawn()，所以「提升出来没人叫」的空窗不会超过桥的一轮。
+ * DS_TEAMS_DISPATCH_TICK_MS 可调，0 关闭（演练/调试用）。 */
+const DISPATCH_TICK_MS = Number(process.env.DS_TEAMS_DISPATCH_TICK_MS ?? 5000);
+if (DISPATCH_TICK_MS > 0) {
+  setInterval(() => {
+    try {
+      // A12（2026-11-08）：接管要排在 watchdog 前面。否则失联端名下的卡会先被判 timeout，
+      // 接管看到非 ACTIVE 就跳过了——活明明还能接到另一端手里，却被记成了超时。
+      takeoverPass(Date.now());
+      const wd = dispatchWatchdog();
+      if (wd.length) console.error("[dispatch] watchdog " + wd.map((x) => `${x.key}(${x.reason})`).join(", "));
+      const pr = dispatchPromote();
+      if (pr.length) console.error("[dispatch] promote " + pr.join(", "));
+    } catch (e) { console.error("[dispatch] tick " + e.message); }
+  }, DISPATCH_TICK_MS).unref();
+}
 
 /* ---------- 单实例锁（2026-11-05）----------
  * 两个实例共用同一份 data/*.json：后写盘的那个会把先写的 sessions.json / rooms.json 覆盖掉。
