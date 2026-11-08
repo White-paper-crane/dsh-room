@@ -1,8 +1,8 @@
-# ds-teams · 隧道协作房间
+# dsh-room · 隧道协作房间
 
 **把本机 AI Agent 的协作过程，变成手机上可参与、可追踪的任务房间。**
 
-基于 Node.js 与原生 Web 的轻量协作原型。浏览器通过隧道访问本机服务，真人在房间里派活，两端 Agent 通过宿主桥接接收消息、提交报告与互评；任务台账记录从开工到验收的过程。
+`dsh-room` 是基于 Node.js 与原生 Web 的轻量协作原型。浏览器通过隧道访问本机服务，真人在房间里派活，两端 Agent 通过宿主桥接接收消息、提交报告与互评；任务台账记录从开工到验收的过程。
 
 > **项目阶段：单机、小规模使用的工程原型。目前无法支持大规模异地部署。**
 > 此仓库是脱敏后的代码展示版，不含真实聊天、密钥、成员数据或原仓库历史。GitHub 托管的是源码，不是已上线的在线服务。
@@ -67,23 +67,23 @@
               DSH 会话（Agent 运行在宿主机上）
 ```
 
-服务端只做三件事：存消息、管台账、把该唤醒的人叫醒。Agent 的能力来自宿主的会话，`ds-teams` 不执行模型的代码。
+服务端只做三件事：存消息、管台账、把该唤醒的人叫醒。Agent 的能力来自宿主的会话，`dsh-room` 不执行模型的代码。
 
 ## 本地运行
 
 要求：Node.js 22+（用到 `node:test`、全局 `fetch`），不需要安装依赖。
 
 ```bash
-git clone https://github.com/White-paper-crane/ds-teams.git
-cd ds-teams
+git clone https://github.com/White-paper-crane/dsh-room.git
+cd dsh-room
 node server.mjs
 ```
 
 Windows PowerShell：
 
 ```powershell
-git clone https://github.com/White-paper-crane/ds-teams.git
-cd ds-teams
+git clone https://github.com/White-paper-crane/dsh-room.git
+cd dsh-room
 node server.mjs
 ```
 
@@ -116,7 +116,7 @@ node server.mjs
 
 ```powershell
 $env:DS_TEAMS_PORT = "8792"
-$env:DS_TEAMS_DATA_DIR = "D:\ds-teams\data"
+$env:DS_TEAMS_DATA_DIR = "D:\dsh-room\data"
 node server.mjs
 ```
 
@@ -124,7 +124,7 @@ node server.mjs
 
 生产上建议交给系统级守护，而不是开着的终端窗口：
 
-- **Windows**：把 `node server.mjs` 包进计划任务（「无论用户是否登录都运行」），或用 `nssm install ds-teams`；退出码非 0 自动拉起。
+- **Windows**：把 `node server.mjs` 包进计划任务（「无论用户是否登录都运行」），或用 `nssm install dsh-room`；退出码非 0 自动拉起。
 - **Linux**：systemd unit，`Restart=on-failure`，`WorkingDirectory` 指向仓库根。
 - **健康检查**：`GET /api/health` 返回 200 与 JSON 摘要；守护脚本按它判断存活，别只看端口能不能连。
 - **日志**：stdout 直接进守护进程的日志（Windows 计划任务可重定向到文件）；台账巡检、接管、锁超时都会打一行前缀，排障先看这些。
