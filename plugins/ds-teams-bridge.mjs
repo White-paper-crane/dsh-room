@@ -43,6 +43,9 @@ const { writeEnd, markEndArchived, endOpts } = await import(pathToFileURL(path.j
 // 判定放共享纯函数库（两端同一条判据，与 ds-teams-bridge-me.mjs 对称）。
 const { createHoldBook, noteHold, clearHold, settleHold, phaseKind, isBusyKind, lastSeqTimeFromLog, decideStuck } = await import(pathToFileURL(path.join(ROOT, "stuck-guard-lib.mjs")).href + "?v=" + Date.now());
 const { createHoldClock, HOLD_MAX_MS } = await import(pathToFileURL(path.join(ROOT, "hold-lib.mjs")).href + "?v=" + Date.now());
+// 2026-11-10：关房即清理——把会话目录 rename 进 Desktop\trash\<日期>\room-sessions（同盘原子）。
+// 传 ?v= 时间戳同 dispatch-lib：宿主机缓存同 URL 模块，改了不重启会拿到旧版。
+const { trashSession } = await import(pathToFileURL(path.join(ROOT, "session-trash.mjs")).href + "?v=" + Date.now());
 // T5（2026-11-07）：闸门拒绝后的房内说明文案，放共享纯函数库，两端同一份、同一幂等键。
 const { noticeFor } = await import(pathToFileURL(path.join(ROOT, "wake-notice-lib.mjs")).href + "?v=" + Date.now());
 // T4（2026-11-07）：claim 适用范围——file / task / system 也要 claim，否则两端各注入一次（双投）。
@@ -60,6 +63,11 @@ const DAMAN = process.env.DS_TEAMS_DAMAN_SESSION || "";
 // P2 单房灰度（2026-11-04）：房 → 专属会话台账。只读文件；**改文件即回滚**，不用重挂载。
 // 缺失 / enabled:false / 无此房 → 全部退回上面那个共用会话（旧行为，零差异）。
 const ROOM_SESSIONS_FILE = ROOT + "\\data\\room-sessions.json";
+// 2026-11-10（用户定）：轮询跟「隧道开着 + 有 open 房」绑定——两者都满足才 2s，否则 30s。
+// 隧道状态读 scripts\tunnel.mjs 写的 tunnel.json（pid 必须验活，残留死 pid 不算开）。
+const TUNNEL_FILE = ROOT + "\\data\\tunnel.json";
+const POLL_ACTIVE_MS = 2000;
+const POLL_IDLE_MS = 30_000;
 const COOLDOWN_MS = 3000;
 // 供应商与模型由代码决定，不随 GUI 选择漂移（会议室 v1.1：用户 2026-11-04 要求两端统一走
 // 自定义供应商 TokenRocks 的 flash 档，不再用官网 deepseek-account）。providers 定义见
@@ -155,6 +163,9 @@ export function apply(ctx) {
   let failStreak = 0;
   let pollDelay = 2000;
   let nextAllowedAt = 0;
+  // 2026-11-10：上一 tick 的房列表，供 finally 里判「隧道开 + 有 open 房」；idle 日志只打一次。
+  let lastRooms = [];
+  let idleLogged = false;
   // C5：ack 补发按房记（以前是单值，一间房 ack 失败会被另一间房的成功冲掉）。key = roomId 或 "-"。
   const pendingAcks = new Map();
   const PA = (roomId) => (roomId ? String(roomId) : "-");
@@ -314,6 +325,22 @@ export function apply(ctx) {
   // 5 秒缓存：改 room-sessions.json 后 ≤5s 生效——这就是回滚通道（比环境变量/重挂载快得多）。
   // B2（2026-11-04）：bySid 缓存同一批叶子的原样对象，供 optsFor(sessionId) 查 provider/model 覆盖。
   let rsCache = { at: 0, byRoom: new Map(), bySid: new Map() };
+  // 2026-11-10：整表日志的去重指纹（见 roomSessions 里）。
+  let rsLogKey = "";
+  // 2026-11-10：隧道是否真的活着（tunnel.json 有 pid 且进程还在）。10s 缓存，避免每 tick 碰盘。
+  // 残留死 pid（cloudflared 崩了但文件没删）不算开，所以只看文件不够，必须 process.kill(pid, 0) 验活。
+  let tunnelCache = { at: 0, alive: false };
+  const tunnelAlive = () => {
+    if (Date.now() - tunnelCache.at < 10_000) return tunnelCache.alive;
+    let alive = false;
+    try {
+      const j = JSON.parse(fs.readFileSync(TUNNEL_FILE, "utf8").replace(/^\uFEFF/, ""));
+      const pid = Number(j && j.pid);
+      if (Number.isFinite(pid) && pid > 0) { try { process.kill(pid, 0); alive = true; } catch { alive = false; } }
+    } catch { alive = false; }
+    tunnelCache = { at: Date.now(), alive };
+    return alive;
+  };
   const roomSessions = () => {
     if (Date.now() - rsCache.at < 5000) return rsCache;
     let j = null;
@@ -333,7 +360,11 @@ export function apply(ctx) {
       }
     }
     rsCache = { at: Date.now(), byRoom, bySid };
-    if (byRoom.size) log("room-sessions: " + [...byRoom].map(([r, s]) => r + "->" + s).join(", "));
+    // 2026-11-10：只在映射变化时打一行。以前每 5s 缓存过期就整表打印（5.2KB/行），
+    // 11-08/09 host 日志各 44/45MB、99% 是这一行。功能不改：映射变了仍然看得见。
+    const key = [...byRoom].map(([r, s]) => r + "->" + s).sort().join(", ");
+    if (byRoom.size && key !== rsLogKey) { rsLogKey = key; log("room-sessions: " + key); }
+    if (!byRoom.size) rsLogKey = "";
     return rsCache;
   };
   // 唯一入口：房有专属会话就用它，否则回落共用会话（= 未启用灰度时的现有行为）。
@@ -447,6 +478,17 @@ export function apply(ctx) {
         if (ctl) await ctl.archiveSession({ sessionId: leaf.sessionId, stopActivity: true });
         markEndArchived(ROOM_SESSIONS_FILE, rid, WHO);
         rsCache.at = 0;
+        // 2026-11-10：会话已归档（不再注入、不再保活）→ 目录也搬去回收站，
+        // 否则空房会话一直堆在 .dsh\sessions 里拖慢 DSH 启动扫描。
+        try {
+          const t = trashSession(leaf.sessionId);
+          if (t.ok) {
+            evt({ action: "room-session-trashed", room: rid, sessionId: leaf.sessionId, who: WHO, bytes: t.bytes });
+            log(`room gone -> trashed dir ${leaf.sessionId} (${Math.round((t.bytes || 0) / 1024)}KB) room=${rid}`);
+          } else {
+            evtOnce("room-trash-fail:" + rid, { action: "room-session-trash-fail", room: rid, sessionId: leaf.sessionId, who: WHO, reason: t.reason });
+          }
+        } catch (e2) { log("trash session dir failed: " + String((e2 && e2.message) ?? e2)); }
         evt({ action: "room-session-archived", room: rid, sessionId: leaf.sessionId, who: WHO });
         log(`room gone -> archived session ${leaf.sessionId} (room=${rid})`);
       } catch (e) {
@@ -1061,6 +1103,7 @@ export function apply(ctx) {
       const s = st.s;
       const msgs = Array.isArray(s.messages) ? s.messages : [];
       const rooms = Array.isArray(s.rooms) ? s.rooms : [];
+      lastRooms = rooms;   // 2026-11-10：供 finally 里的 idle 判定（隧道关/没房 → 30s）
       // ④ 补 ack（上次 ack 5xx/网络失败的重试；按房分别记，累积语义，推至该房最新 seq 即覆盖更早的）。
       for (const [k, p] of [...pendingAcks]) {
         const a = await ackPost(p.seq, p.roomId);
@@ -1186,7 +1229,16 @@ export function apply(ctx) {
       evt({ action: "error", where: "tick", message: String((e && e.message) ?? e).slice(0, 300) });
     } finally {
       busy = false;
-      nextAllowedAt = Date.now() + pollDelay;
+      // 2026-11-10：轮询频率跟「隧道开着 + 有 open 房」绑定——两者都满足才用退避后的 pollDelay（2s 起），
+      // 否则降到 30s（空转时不打服务端、不刷日志）。只改节奏，不改心跳/注入语义。
+      const anyOpen = lastRooms.some((r) => r && r.status === "open");
+      const active = tunnelAlive() && anyOpen;
+      if (!active && !idleLogged) {
+        idleLogged = true;
+        log("poll idle: tunnel=" + (tunnelAlive() ? "up" : "down") + " openRooms=" + lastRooms.filter((r) => r && r.status === "open").length + " -> " + POLL_IDLE_MS + "ms");
+      }
+      if (active) idleLogged = false;
+      nextAllowedAt = Date.now() + (active ? pollDelay : POLL_IDLE_MS);
     }
   };
 
@@ -1206,7 +1258,7 @@ export function apply(ctx) {
   later(run("poll", tick), 1000);
   every(run("poll", tick), 2000);
   // 心跳：确认插件真的在被调度（每 60 秒一行，便于在不看消息时判断是否加载）
-  every(run("beat", () => { log("alive g" + gen + " seq=" + (cursor ?? "?") + " agents=" + (agents() ? "yes" : "no")); }), 60000);
+  every(run("beat", () => { log("alive g" + gen + " seq=" + (cursor ?? "?") + " agents=" + (agents() ? "yes" : "no")); }), 300000);
   // 被新一代实例取代后自行熄火（双保险：即使 effect 清理没跑到也不会重复轮询/重复投递）
   every(() => {
     if (disposed || globalThis[GEN_KEY] === gen) return;
